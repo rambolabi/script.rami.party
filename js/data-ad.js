@@ -2825,6 +2825,462 @@
     }
   );
 
+  /* -------------------------------------- local directory troubleshooting */
+
+  SPECS.push(
+    {
+      id: 'ad-dc-locator',
+      t: 'Which DC this machine uses (DC locator)',
+      p: ['Domain', 'Network', 'Troubleshooting'],
+      d: 'Shows which domain controller the locator picked and in which site, the first check for slow logons or a client that binds to a DC across the WAN.',
+      k: 'nltest dsgetdc logonserver dclist dsgetsite locator site coverage wrong dc slow logon cannot find domain controller',
+      req: 'nltest ships with Windows; the PowerShell discovery mode needs the ActiveDirectory module (RSAT).',
+      more: [
+        {
+          id: 'mode', label: 'Check', type: 'single', items: [
+            { id: 'current', label: 'Current logon server and site', default: true },
+            { id: 'discover', label: 'Run discovery (nltest /dsgetdc)' },
+            { id: 'force', label: 'Rediscover, bypassing the cache' },
+            { id: 'list', label: 'Every DC the locator knows' },
+            { id: 'ps', label: 'PowerShell discovery (Get-ADDomainController)' }
+          ]
+        },
+        { id: 'domain', label: 'Domain (optional)', type: 'text', placeholder: 'contoso.com', hint: 'Empty targets the domain of this machine.' }
+      ],
+      build: sel => {
+        const dom = q(sel.domain) || '$env:USERDNSDOMAIN';
+        if (sel.mode === 'discover') return 'nltest /dsgetdc:' + dom;
+        if (sel.mode === 'force') return 'nltest /dsgetdc:' + dom + ' /force';
+        if (sel.mode === 'list') return 'nltest /dclist:' + dom;
+        if (sel.mode === 'ps') {
+          const domArg = q(sel.domain) ? " -DomainName '" + q(sel.domain) + "'" : '';
+          return 'Get-ADDomainController -Discover -ForceDiscover -Writable' + domArg + ' |\n    Format-List Name, HostName, Site, IPv4Address, Domain';
+        }
+        return [
+          '$env:LOGONSERVER',
+          'nltest /dsgetsite',
+          'nltest /sc_query:' + dom
+        ].join('\n');
+      }
+    },
+    {
+      id: 'ad-dc-srv-records',
+      t: 'DC locator SRV records in DNS',
+      p: ['DNS', 'Domain', 'Troubleshooting'],
+      d: 'Checks the _msdcs SRV records that clients need to find a DC, and re-registers them when a DC is missing from DNS.',
+      k: 'srv record _ldap._tcp.dc._msdcs kerberos gc kpasswd dns registration dsregdns netlogon missing domain not found',
+      req: 'Resolve-DnsName ships with Windows; the repair step needs the ActiveDirectory module and WinRM access to the DCs.',
+      more: [
+        { id: 'domain', label: 'Domain', type: 'text', placeholder: 'contoso.com', hint: 'Empty uses the domain of this machine.' },
+        {
+          id: 'records', label: 'Records', type: 'multi', wide: true, items: [
+            { id: 'ldap', label: 'LDAP (_ldap._tcp.dc._msdcs)', default: true },
+            { id: 'kerberos', label: 'Kerberos (_kerberos._tcp.dc._msdcs)', default: true },
+            { id: 'gc', label: 'Global catalog (_gc._tcp)', default: true },
+            { id: 'pdc', label: 'PDC (_ldap._tcp.pdc._msdcs)' },
+            { id: 'kpasswd', label: 'Password change (_kpasswd._tcp)' }
+          ]
+        },
+        {
+          id: 'fix', label: 'Repair', type: 'multi', items: [
+            { id: 'reregister', label: 'Re-register the DNS records of every DC (nltest /dsregdns)' }
+          ]
+        }
+      ],
+      build: sel => {
+        const names = [];
+        if (sel.records.has('ldap')) names.push('_ldap._tcp.dc._msdcs');
+        if (sel.records.has('kerberos')) names.push('_kerberos._tcp.dc._msdcs');
+        if (sel.records.has('gc')) names.push('_gc._tcp');
+        if (sel.records.has('pdc')) names.push('_ldap._tcp.pdc._msdcs');
+        if (sel.records.has('kpasswd')) names.push('_kpasswd._tcp');
+        if (!names.length) names.push('_ldap._tcp.dc._msdcs');
+        const lines = [
+          '$domain = ' + (q(sel.domain) ? "'" + q(sel.domain) + "'" : '$env:USERDNSDOMAIN'),
+          "'" + names.join("', '") + "' | ForEach-Object {",
+          '    Resolve-DnsName -Name "$_.$domain" -Type SRV -ErrorAction SilentlyContinue |',
+          "        Where-Object { $_.Type -eq 'SRV' } |",
+          "        Select-Object @{N='Record';E={$_.Name}}, NameTarget, Port, Priority, Weight",
+          '} | Format-Table -AutoSize'
+        ];
+        if (sel.fix.has('reregister')) {
+          lines.push('Get-ADDomainController -Filter * | ForEach-Object {');
+          lines.push('    Invoke-Command -ComputerName $_.HostName -ScriptBlock { nltest /dsregdns }');
+          lines.push('}');
+        }
+        return lines.join('\n');
+      }
+    },
+    {
+      id: 'ad-dc-port-test',
+      t: 'Test the AD ports on the domain controllers',
+      p: ['Network', 'Domain', 'Troubleshooting'],
+      d: 'Tests the ports a member machine must reach on every DC, the quickest way to spot a firewall that breaks joins or logons.',
+      k: 'test-netconnection port 53 88 135 389 445 464 636 3268 9389 kerberos ldap smb ldaps gc adws firewall blocked',
+      more: [
+        { id: 'dc', label: 'One DC (optional)', type: 'text', placeholder: 'dc01.contoso.com', hint: 'Empty tests every domain controller.' },
+        {
+          id: 'groups', label: 'Ports', type: 'multi', wide: true, items: [
+            { id: 'core', label: 'Core: DNS 53, Kerberos 88, LDAP 389, SMB 445', default: true },
+            { id: 'kpass', label: 'Kerberos password 464' },
+            { id: 'rpc', label: 'RPC endpoint mapper 135' },
+            { id: 'secure', label: 'LDAPS 636 and global catalog 3268/3269' },
+            { id: 'adws', label: 'AD Web Services 9389' }
+          ]
+        },
+        {
+          id: 'view', label: 'Show', type: 'single', items: [
+            { id: 'all', label: 'Every result', default: true },
+            { id: 'closed', label: 'Only blocked ports' }
+          ]
+        }
+      ],
+      build: sel => {
+        const ports = [];
+        if (sel.groups.has('core')) ports.push(53, 88, 389, 445);
+        if (sel.groups.has('kpass')) ports.push(464);
+        if (sel.groups.has('rpc')) ports.push(135);
+        if (sel.groups.has('secure')) ports.push(636, 3268, 3269);
+        if (sel.groups.has('adws')) ports.push(9389);
+        if (!ports.length) ports.push(88, 389);
+        const dc = q(sel.dc);
+        const lines = [
+          '$ports = ' + ports.join(', '),
+          dc ? "$dcs = '" + dc + "'" : '$dcs = (Get-ADDomainController -Filter *).HostName',
+          '$report = foreach ($dc in $dcs) {',
+          '    foreach ($port in $ports) {',
+          '        $test = Test-NetConnection -ComputerName $dc -Port $port -WarningAction SilentlyContinue',
+          '        [pscustomobject]@{ DC = $dc; Port = $port; Open = $test.TcpTestSucceeded }',
+          '    }',
+          '}'
+        ];
+        if (sel.view === 'closed') lines.push('$report | Where-Object { -not $_.Open } | Format-Table -AutoSize');
+        else lines.push('$report | Format-Table -AutoSize');
+        return lines.join('\n');
+      }
+    },
+    {
+      id: 'ad-kerberos-tickets',
+      t: 'Kerberos tickets on this machine',
+      p: ['Security', 'Troubleshooting'],
+      d: 'Lists the cached Kerberos tickets, requests a fresh one to prove the KDC answers, or clears a stale cache.',
+      k: 'klist tgt purge ticket cache kvno krbtgt expired renew logon 0x3e7 machine account kerberos',
+      req: 'klist ships with Windows; clearing the machine ticket cache needs an elevated session.',
+      more: [
+        {
+          id: 'mode', label: 'Action', type: 'single', items: [
+            { id: 'tickets', label: 'List the cached tickets', default: true },
+            { id: 'tgt', label: 'Show the TGT' },
+            { id: 'test', label: 'Request a ticket now (tests the KDC)' },
+            { id: 'purge', label: 'Purge the ticket cache' },
+            { id: 'sessions', label: 'List the logon sessions' }
+          ]
+        }
+      ],
+      build: sel => {
+        if (sel.mode === 'tgt') return 'klist tgt';
+        if (sel.mode === 'test') return 'klist get krbtgt/$env:USERDNSDOMAIN';
+        if (sel.mode === 'sessions') return 'klist sessions';
+        if (sel.mode === 'purge') {
+          return [
+            'klist purge',
+            '# The machine account keeps its own cache; clear it from an elevated session:',
+            'klist -li 0x3e7 purge'
+          ].join('\n');
+        }
+        return 'klist';
+      }
+    },
+    {
+      id: 'ad-duplicate-spns',
+      t: 'Duplicate service principal names',
+      p: ['Security', 'Troubleshooting', 'Audit'],
+      d: 'Finds SPNs registered on more than one account, the classic cause of KRB_AP_ERR_MODIFIED and services that fall back to NTLM.',
+      k: 'setspn duplicate spn krb_ap_err_modified kerberos ntlm fallback service principal name query forest',
+      more: [
+        {
+          id: 'mode', label: 'Check', type: 'single', items: [
+            { id: 'dup', label: 'Search the forest for duplicates (setspn -X)', default: true },
+            { id: 'ps', label: 'Duplicate report with the accounts (PowerShell)' },
+            { id: 'query', label: 'Look up one SPN (setspn -Q)' },
+            { id: 'list', label: 'List the SPNs of one account (setspn -L)' }
+          ]
+        },
+        { id: 'spn', label: 'SPN to look up', type: 'text', placeholder: 'HTTP/intranet.contoso.com' },
+        { id: 'account', label: 'Account', type: 'text', placeholder: 'CONTOSO\\websrv01$' }
+      ],
+      build: sel => {
+        if (sel.mode === 'query') return 'setspn -Q ' + (sel.spn.trim() || 'HTTP/intranet.contoso.com');
+        if (sel.mode === 'list') return 'setspn -L ' + (sel.account.trim() || 'CONTOSO\\websrv01$');
+        if (sel.mode === 'ps') {
+          return [
+            "$spns = Get-ADObject -LDAPFilter '(servicePrincipalName=*)' -Properties servicePrincipalName |",
+            '    ForEach-Object { $obj = $_; $obj.servicePrincipalName | ForEach-Object { [pscustomobject]@{ SPN = $_; Account = $obj.Name } } }',
+            '$spns | Group-Object SPN | Where-Object { $_.Count -gt 1 } |',
+            "    ForEach-Object { [pscustomobject]@{ SPN = $_.Name; Accounts = ($_.Group.Account -join ', ') } } |",
+            '    Format-Table -AutoSize'
+          ].join('\n');
+        }
+        return 'setspn -X -F';
+      }
+    },
+    {
+      id: 'ad-ds-event-errors',
+      t: 'Error sweep of the DC event logs',
+      p: ['Domain', 'Troubleshooting', 'Audit'],
+      d: 'Collects recent errors from the Directory Service, DNS Server and DFS Replication logs of every DC into one list.',
+      k: 'directory service event log error warning dns server dfs replication kcc 1311 2042 13508 sweep triage',
+      req: 'Rights to read the event logs on the domain controllers.',
+      more: [
+        { id: 'days', label: 'Look back (days)', type: 'number', placeholder: '1', value: '1' },
+        {
+          id: 'logs', label: 'Logs', type: 'multi', wide: true, items: [
+            { id: 'ds', label: 'Directory Service', default: true },
+            { id: 'dns', label: 'DNS Server', default: true },
+            { id: 'dfsr', label: 'DFS Replication', default: true },
+            { id: 'system', label: 'System' }
+          ]
+        },
+        {
+          id: 'level', label: 'Severity', type: 'single', items: [
+            { id: 'error', label: 'Errors only' },
+            { id: 'warn', label: 'Errors and warnings', default: true }
+          ]
+        },
+        {
+          id: 'view', label: 'View', type: 'single', items: [
+            { id: 'detail', label: 'Every event', default: true },
+            { id: 'summary', label: 'Count per DC and event id' }
+          ]
+        }
+      ],
+      build: sel => {
+        const logs = [];
+        if (sel.logs.has('ds')) logs.push('Directory Service');
+        if (sel.logs.has('dns')) logs.push('DNS Server');
+        if (sel.logs.has('dfsr')) logs.push('DFS Replication');
+        if (sel.logs.has('system')) logs.push('System');
+        if (!logs.length) logs.push('Directory Service');
+        const lines = [
+          '$cut = (Get-Date).AddDays(-' + num(sel.days, 1) + ')',
+          "$logs = '" + logs.join("', '") + "'",
+          '$report = foreach ($dc in (Get-ADDomainController -Filter *).HostName) {',
+          '    foreach ($log in $logs) {',
+          '        Get-WinEvent -ComputerName $dc -FilterHashtable @{ LogName = $log; Level = ' + (sel.level === 'error' ? '1, 2' : '1, 2, 3') + '; StartTime = $cut } -MaxEvents 200 -ErrorAction SilentlyContinue |',
+          "            Select-Object @{N='DC';E={$dc}}, @{N='Log';E={$log}}, TimeCreated, Id, LevelDisplayName,",
+          '                @{N=\'Message\';E={($_.Message -split "`n")[0]}}',
+          '    }',
+          '}'
+        ];
+        if (sel.view === 'summary') lines.push('$report | Group-Object DC, Id -NoElement | Sort-Object Count -Descending | Format-Table -AutoSize');
+        else lines.push('$report | Sort-Object TimeCreated -Descending | Format-Table -AutoSize -Wrap');
+        return lines.join('\n');
+      }
+    },
+    {
+      id: 'ad-ntds-database',
+      t: 'NTDS database size and whitespace',
+      p: ['Domain', 'Files & Disk', 'Troubleshooting'],
+      d: 'Measures ntds.dit and the free space next to it on every DC, plus the whitespace inside the database an offline defrag would return.',
+      k: 'ntds.dit database size disk space whitespace 1646 garbage collection offline defrag compact ntdsutil',
+      req: 'Remote management (WinRM) access to the domain controllers.',
+      more: [
+        {
+          id: 'checks', label: 'Checks', type: 'multi', wide: true, items: [
+            { id: 'size', label: 'File size and free disk space', default: true },
+            { id: 'whitespace', label: 'Recoverable whitespace (event 1646)' },
+            { id: 'logging', label: 'Enable garbage collection logging for 1646' }
+          ]
+        }
+      ],
+      build: sel => {
+        const lines = [];
+        if (sel.checks.has('size') || !sel.checks.size) {
+          lines.push('Get-ADDomainController -Filter * | ForEach-Object {');
+          lines.push('    Invoke-Command -ComputerName $_.HostName -ScriptBlock {');
+          lines.push("        $params = Get-ItemProperty 'HKLM:\\SYSTEM\\CurrentControlSet\\Services\\NTDS\\Parameters'");
+          lines.push("        $dit = Get-Item $params.'DSA Database file'");
+          lines.push('        [pscustomobject]@{');
+          lines.push('            DC     = $env:COMPUTERNAME');
+          lines.push('            Path   = $dit.FullName');
+          lines.push('            SizeGB = [math]::Round($dit.Length / 1GB, 2)');
+          lines.push('            FreeGB = [math]::Round((Get-PSDrive -Name $dit.PSDrive.Name).Free / 1GB, 2)');
+          lines.push("            Logs   = $params.'Database log files path'");
+          lines.push('        }');
+          lines.push('    }');
+          lines.push('} | Format-Table -AutoSize');
+        }
+        if (sel.checks.has('whitespace')) {
+          lines.push('# 1646 is only logged while garbage collection logging is 1 or higher.');
+          lines.push('Get-ADDomainController -Filter * | ForEach-Object {');
+          lines.push("    Get-WinEvent -ComputerName $_.HostName -FilterHashtable @{ LogName = 'Directory Service'; Id = 1646 } -MaxEvents 1 -ErrorAction SilentlyContinue |");
+          lines.push('        Select-Object MachineName, TimeCreated, Message');
+          lines.push('} | Format-List');
+        }
+        if (sel.checks.has('logging')) {
+          lines.push('Get-ADDomainController -Filter * | ForEach-Object {');
+          lines.push('    Invoke-Command -ComputerName $_.HostName -ScriptBlock {');
+          lines.push("        Set-ItemProperty 'HKLM:\\SYSTEM\\CurrentControlSet\\Services\\NTDS\\Diagnostics' -Name '6 Garbage Collection' -Value 1");
+          lines.push('    }');
+          lines.push('}');
+        }
+        return lines.join('\n');
+      }
+    },
+    {
+      id: 'ad-lingering-objects',
+      t: 'Lingering objects and USN rollback',
+      p: ['Replication', 'Troubleshooting', 'Security'],
+      d: 'Hunts for the events and registry marks a lingering object or a rolled back DC leaves behind, and prepares the advisory mode cleanup.',
+      k: 'lingering objects 1388 1988 2042 usn rollback 2095 dsa not writable strict replication consistency repadmin removelingeringobjects advisory',
+      req: 'Rights to read event logs and registry on the DCs; repadmin for the cleanup command.',
+      more: [
+        {
+          id: 'mode', label: 'Check', type: 'single', items: [
+            { id: 'events', label: 'Scan the DC logs for the tell-tale events', default: true },
+            { id: 'strict', label: 'Strict replication consistency per DC' },
+            { id: 'usn', label: 'USN rollback markers' },
+            { id: 'advisory', label: 'Advisory mode cleanup (repadmin)' }
+          ]
+        },
+        { id: 'ref', label: 'Known clean DC (for the cleanup)', type: 'text', placeholder: 'dc01.contoso.com' }
+      ],
+      build: sel => {
+        if (sel.mode === 'strict') {
+          return [
+            'Get-ADDomainController -Filter * | ForEach-Object {',
+            '    $value = Invoke-Command -ComputerName $_.HostName -ScriptBlock {',
+            "        (Get-ItemProperty 'HKLM:\\SYSTEM\\CurrentControlSet\\Services\\NTDS\\Parameters' -ErrorAction SilentlyContinue).'Strict Replication Consistency'",
+            '    }',
+            '    [pscustomobject]@{ DC = $_.HostName; StrictReplicationConsistency = $value }',
+            '} | Format-Table -AutoSize'
+          ].join('\n');
+        }
+        if (sel.mode === 'usn') {
+          return [
+            'Get-ADDomainController -Filter * | ForEach-Object {',
+            '    $dc = $_.HostName',
+            '    $marker = Invoke-Command -ComputerName $dc -ScriptBlock {',
+            "        (Get-ItemProperty 'HKLM:\\SYSTEM\\CurrentControlSet\\Services\\NTDS\\Parameters' -ErrorAction SilentlyContinue).'Dsa Not Writable'",
+            '    }',
+            "    $last = Get-WinEvent -ComputerName $dc -FilterHashtable @{ LogName = 'Directory Service'; Id = 2095 } -MaxEvents 1 -ErrorAction SilentlyContinue",
+            '    [pscustomobject]@{ DC = $dc; DsaNotWritable = $marker; LastUsnRollbackEvent = $last.TimeCreated }',
+            '} | Format-Table -AutoSize'
+          ].join('\n');
+        }
+        if (sel.mode === 'advisory') {
+          const ref = q(sel.ref) || 'dc01.contoso.com';
+          return [
+            '# Advisory mode only reports. Remove /advisory_mode to actually delete.',
+            "$ref = '" + ref + "'",
+            '$refGuid = (Get-ADObject -Identity (Get-ADDomainController -Identity $ref).NTDSSettingsObjectDN -Properties objectGUID).objectGUID',
+            '$nc = (Get-ADDomain).DistinguishedName',
+            'Get-ADDomainController -Filter * | Where-Object { $_.HostName -ne $ref } | ForEach-Object {',
+            '    repadmin /removelingeringobjects $_.HostName $refGuid $nc /advisory_mode',
+            '}'
+          ].join('\n');
+        }
+        return [
+          '$report = foreach ($dc in (Get-ADDomainController -Filter *).HostName) {',
+          "    Get-WinEvent -ComputerName $dc -FilterHashtable @{ LogName = 'Directory Service'; Id = 1388, 1988, 2042, 2095 } -MaxEvents 20 -ErrorAction SilentlyContinue |",
+          '        Select-Object @{N=\'DC\';E={$dc}}, TimeCreated, Id, @{N=\'Message\';E={($_.Message -split "`n")[0]}}',
+          '}',
+          '$report | Sort-Object TimeCreated -Descending | Format-Table -AutoSize -Wrap'
+        ].join('\n');
+      }
+    },
+    {
+      id: 'ad-rid-pool',
+      t: 'RID pool health',
+      p: ['Domain', 'Troubleshooting', 'Audit'],
+      d: 'Shows how much of the RID space the domain has issued and what each DC still holds, because new accounts fail once the pool runs dry.',
+      k: 'rid master pool exhaustion ridavailablepool rid set allocation dcdiag ridmanager cannot create account 8228',
+      more: [
+        {
+          id: 'mode', label: 'Report', type: 'single', items: [
+            { id: 'summary', label: 'Issued and remaining RIDs', default: true },
+            { id: 'perdc', label: 'RID set per DC' },
+            { id: 'dcdiag', label: 'dcdiag /test:ridmanager' }
+          ]
+        }
+      ],
+      build: sel => {
+        if (sel.mode === 'perdc') {
+          return [
+            'Get-ADDomainController -Filter * | ForEach-Object {',
+            '    $setDN = [string](Get-ADComputer -Identity $_.Name -Properties rIDSetReferences).rIDSetReferences',
+            '    $set = Get-ADObject -Identity $setDN -Properties rIDAllocationPool, rIDNextRID',
+            '    $pool = [int64]$set.rIDAllocationPool',
+            '    [pscustomobject]@{',
+            '        DC        = $_.HostName',
+            '        PoolStart = $pool -band 0xFFFFFFFF',
+            '        PoolEnd   = $pool -shr 32',
+            '        NextRID   = $set.rIDNextRID',
+            '    }',
+            '} | Format-Table -AutoSize'
+          ].join('\n');
+        }
+        if (sel.mode === 'dcdiag') return "dcdiag /test:ridmanager /v | Select-String 'rid|pool|passed|failed'";
+        return [
+          '$domain = Get-ADDomain',
+          '$rid = Get-ADObject -Identity "CN=RID Manager$,CN=System,$($domain.DistinguishedName)" -Properties rIDAvailablePool -Server $domain.RIDMaster',
+          '$issued = [int64]$rid.rIDAvailablePool -band 0xFFFFFFFF',
+          '[pscustomobject]@{',
+          '    RIDMaster   = $domain.RIDMaster',
+          '    Issued      = $issued',
+          '    Remaining   = 1073741823 - $issued',
+          '    PercentUsed = [math]::Round($issued / 1073741823 * 100, 2)',
+          '} | Format-List'
+        ].join('\n');
+      }
+    },
+    {
+      id: 'ad-sysvol-shares',
+      t: 'SYSVOL and NETLOGON share check',
+      p: ['Replication', 'Group Policy', 'Troubleshooting'],
+      d: 'Confirms every DC actually exposes SYSVOL and NETLOGON, and digs into the DFSR state behind a share that has gone missing.',
+      k: 'sysvol netlogon share missing dfsrmig migration state 2213 dirty shutdown journal wrap dcdiag netlogons gpo not applying',
+      req: 'ActiveDirectory module; the DFSR checks need remote management access to the DCs.',
+      more: [
+        {
+          id: 'checks', label: 'Checks', type: 'multi', wide: true, items: [
+            { id: 'shares', label: 'Shares per DC', default: true },
+            { id: 'dcdiag', label: 'dcdiag /test:netlogons' },
+            { id: 'migration', label: 'DFSR migration state (dfsrmig)' },
+            { id: 'dirty', label: 'DFSR dirty shutdown events (2213)' }
+          ]
+        }
+      ],
+      build: sel => {
+        const lines = [];
+        if (sel.checks.has('shares') || !sel.checks.size) {
+          lines.push('Get-ADDomainController -Filter * | ForEach-Object {');
+          lines.push('    [pscustomobject]@{');
+          lines.push('        DC       = $_.HostName');
+          lines.push('        SYSVOL   = Test-Path "\\\\$($_.HostName)\\SYSVOL"');
+          lines.push('        NETLOGON = Test-Path "\\\\$($_.HostName)\\NETLOGON"');
+          lines.push('    }');
+          lines.push('} | Format-Table -AutoSize');
+        }
+        if (sel.checks.has('dcdiag')) lines.push('dcdiag /e /test:netlogons');
+        if (sel.checks.has('migration')) {
+          lines.push('Invoke-Command -ComputerName (Get-ADDomain).PDCEmulator -ScriptBlock {');
+          lines.push('    dfsrmig /getglobalstate');
+          lines.push('    dfsrmig /getmigrationstate');
+          lines.push('}');
+        }
+        if (sel.checks.has('dirty')) {
+          lines.push('# A 2213 event contains the exact command that resumes replication on that DC.');
+          lines.push('Get-ADDomainController -Filter * | ForEach-Object {');
+          lines.push("    Get-WinEvent -ComputerName $_.HostName -FilterHashtable @{ LogName = 'DFS Replication'; Id = 2213 } -MaxEvents 3 -ErrorAction SilentlyContinue |");
+          lines.push('        Select-Object MachineName, TimeCreated, Id, @{N=\'Message\';E={($_.Message -split "`n")[0]}}');
+          lines.push('} | Format-Table -AutoSize -Wrap');
+        }
+        return lines.join('\n');
+      }
+    }
+  );
+
   /* --- more specs are appended above this marker --- */
 
   SPECS.forEach(s => SCRIPTS.push(adSpec(s)));
